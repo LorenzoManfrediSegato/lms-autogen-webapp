@@ -74,6 +74,29 @@ def generateFilterString(userToken):
     group_ids = ", ".join([obj["id"] for obj in userGroups])
     return f"{AZURE_SEARCH_PERMITTED_GROUPS_COLUMN}/any(g:search.in(g, '{group_ids}'))"
 
+def format_autogen_response(chat_result, model, created, object, conversation_id, title, date, error=None):
+    response_obj = {
+        "id": str(chat_result.chat_id),
+        "model": model,
+        "created": created,
+        "object": object,
+        "choices": [{"messages": []}],
+        "history_metadata": {
+            "conversation_id": conversation_id,
+            "title": title,
+            "date": date
+        },
+        "error": error
+    }
+
+    last_message = chat_result.summary
+    response_obj["choices"][0]["messages"].append(
+        {
+            "role": "assistant",
+            "content": last_message 
+        }  )
+
+    return response_obj
 
 def format_non_streaming_response(chatCompletion, history_metadata, apim_request_id):
     response_obj = {
@@ -175,10 +198,10 @@ def format_pf_non_streaming_response(
             "model": "",
             "created": "",
             "object": "",
-            "history_metadata": history_metadata,
             "choices": [
                 {
                     "messages": messages,
+                    "history_metadata": history_metadata,
                 }
             ]
         }

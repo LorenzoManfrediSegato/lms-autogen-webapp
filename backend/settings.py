@@ -48,7 +48,6 @@ class _UiSettings(BaseSettings):
     chat_description: str = "This chatbot is configured to answer your questions"
     favicon: str = "/favicon.ico"
     show_share_button: bool = True
-    show_chat_history_button: bool = True
 
 
 class _ChatHistorySettings(BaseSettings):
@@ -61,7 +60,7 @@ class _ChatHistorySettings(BaseSettings):
 
     database: str
     account: str
-    account_key: Optional[str] = None
+    account_key: str
     conversations_container: str
     enable_feedback: bool = False
 
@@ -102,7 +101,7 @@ class _AzureOpenAISettings(BaseSettings):
     )
     
     model: str
-    key: Optional[str] = None
+    key: str
     resource: Optional[str] = None
     endpoint: Optional[str] = None
     temperature: float = 0
@@ -201,7 +200,6 @@ class _SearchCommonSettings(BaseSettings):
     include_contexts: Optional[List[str]] = ["citations", "intent"]
     vectorization_dimensions: Optional[int] = None
     role_information: str = Field(
-        default="You are an AI assistant that helps people find information.",
         validation_alias="AZURE_OPENAI_SYSTEM_MESSAGE"
     )
 
@@ -621,20 +619,28 @@ class _AzureSqlServerSettings(BaseSettings, DatasourcePayloadConstructor):
     )
     _type: Literal["azure_sql_server"] = PrivateAttr(default="azure_sql_server")
     
-    connection_string: str = Field(exclude=True)
-    table_schema: str
+    connection_string: Optional[str] = Field(default=None, exclude=True)
+    table_schema: Optional[str] = None
     schema_max_row: Optional[int] = None
     top_n_results: Optional[int] = None
+    database_server: Optional[str] = None
+    database_name: Optional[str] = None
+    port: Optional[int] = None
     
     # Constructed fields
     authentication: Optional[dict] = None
     
     @model_validator(mode="after")
     def construct_authentication(self) -> Self:
-        self.authentication = {
-            "type": "connection_string",
-            "connection_string": self.connection_string
-        }
+        if self.connection_string:
+            self.authentication = {
+                "type": "connection_string",
+                "connection_string": self.connection_string
+            }
+        elif self.database_server and self.database_name and self.port:
+            self.authentication = {
+                "type": "system_assigned_managed_identity"
+            }
         return self
     
     def construct_payload_configuration(

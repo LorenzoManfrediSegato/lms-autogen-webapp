@@ -15,6 +15,13 @@ from quart import (
 )
 
 from openai import AsyncAzureOpenAI
+from autogen import (
+    ConversableAgent, 
+    UserProxyAgent, 
+    GroupChat, 
+    GroupChatManager,
+    AssistantAgent
+)
 from azure.identity.aio import (
     DefaultAzureCredential,
     get_bearer_token_provider
@@ -28,6 +35,7 @@ from backend.settings import (
 )
 from backend.utils import (
     format_as_ndjson,
+    format_autogen_response,
     format_stream_response,
     format_non_streaming_response,
     convert_to_pf_format,
@@ -85,11 +93,86 @@ frontend_settings = {
         "chat_title": app_settings.ui.chat_title,
         "chat_description": app_settings.ui.chat_description,
         "show_share_button": app_settings.ui.show_share_button,
-        "show_chat_history_button": app_settings.ui.show_chat_history_button,
     },
     "sanitize_answer": app_settings.base_settings.sanitize_answer,
 }
 
+# AutoGen Settings
+# Azure AI Search LLM config
+ai_search_datasource = {
+    "data_sources": [
+        {
+            "type": "azure_search",
+            "parameters": {
+                "endpoint": os.environ["AZURE_AI_SEARCH_ENDPOINT"],
+                "authentication": {
+                    "type": "api_key",
+                    "key": os.environ["AZURE_AI_SEARCH_API_KEY"]
+                },
+                "index_name": os.environ["AZURE_AI_SEARCH_INDEX"]
+            }
+        }
+    ]
+}
+
+unstructured_oyd_aoai_llm_config = {
+    "config_list": [
+        {
+            "model": os.environ.get("AZURE_OPENAI_DEPLOYMENT_ID"),
+            "api_key": os.environ.get("AZURE_OPENAI_API_KEY"),
+            "api_type": "azure_search",
+            "base_url": os.environ.get("AZURE_OPENAI_ENDPOINT"),
+            "api_version": os.environ.get("AZURE_API_VERSION")
+        }
+    ],
+    "extra_body": ai_search_datasource
+}
+
+# Azure Sql Server LLM config
+azure_sql_datasource = {
+    "data_sources": [
+        {
+            "type": "azure_sql_server",
+            "parameters": {
+                "authentication": {
+                    "type": "system_assigned_managed_identity"
+                },
+                "database_server": os.environ.get("AZURE_SQL_DATABASE_SERVER"),
+                "database_name": os.environ.get("AZURE_SQL_DATABASE_NAME"),
+                "port": os.environ.get("AZURE_SQL_DATABASE_PORT")
+            }
+        }
+    ]
+}
+
+structured_oyd_aoai_llm_config = {
+    "config_list": [
+        {
+            "model": os.environ.get("AZURE_OPENAI_DEPLOYMENT_ID"),
+            "api_key": os.environ.get("AZURE_OPENAI_API_KEY"),
+            "api_type": "azure_sql_server",
+            "base_url": os.environ.get("AZURE_OPENAI_ENDPOINT"),
+            "api_version": os.environ.get("AZURE_API_VERSION")
+        }
+    ],
+    "extra_body": azure_sql_datasource,
+}
+
+# Basic Agent LLM config
+basic_agent_llm_config = {
+    "config_list": [
+        {
+            "model": "gpt-4o",
+            "api_key": os.environ.get("AZURE_OPENAI_API_KEY"),
+            "api_type": "azure",
+            "base_url": os.environ.get("AZURE_OPENAI_ENDPOINT"),
+            "api_version": os.environ.get("AZURE_API_VERSION")
+        }
+    ]
+}
+
+# Agent Config
+init_agent_config = {"use_docker": False}
 
 # Enable Microsoft Defender for Cloud Integration
 MS_DEFENDER_ENABLED = os.environ.get("MS_DEFENDER_ENABLED", "true").lower() == "true"
@@ -127,7 +210,7 @@ def init_openai_client():
         aoai_api_key = app_settings.azure_openai.key
         ad_token_provider = None
         if not aoai_api_key:
-            logging.debug("No AZURE_OPENAI_KEY found, using Azure Entra ID auth")
+            logging.debug("No AZURE_OPENAI_KEY found, using Azure AD auth")
             ad_token_provider = get_bearer_token_provider(
                 DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
             )
@@ -208,8 +291,7 @@ def prepare_model_args(request_body, request_headers):
     user_json = None
     if (MS_DEFENDER_ENABLED):
         authenticated_user_details = get_authenticated_user_details(request_headers)
-        conversation_id = request_body.get("conversation_id", None)        
-        user_json = get_msdefender_user_json(authenticated_user_details, request_headers, conversation_id)
+        user_json = get_msdefender_user_json(authenticated_user_details, request_headers)
 
     model_args = {
         "messages": messages,
@@ -351,19 +433,77 @@ async def stream_chat_request(request_body, request_headers):
 
     return generate()
 
-
 async def conversation_internal(request_body, request_headers):
     try:
-        if app_settings.azure_openai.stream and not app_settings.base_settings.use_promptflow:
+
+        # Initialize agents and group chat manager
+        initializer_agent = UserProxyAgent(
+            name="Init",
+            code_execution_config=init_agent_config
+        )
+    
+        unstructured_rag_agent = ConversableAgent(
+            name="unstructured_rag_agent",
+            system_message="You are an unstructured RAG agent. You will answer queries related to unstructured data. Usually, these will relate to text data, in the form of reviews or descriptions.",
+            llm_config=unstructured_oyd_aoai_llm_config
+        )
+
+        structured_rag_agent = ConversableAgent(
+            name="structured_rag_agent",
+            system_message="You are a structured RAG agent. You will answer queries related to structured or numerical data.",
+            llm_config=structured_oyd_aoai_llm_config
+        )
+
+        interpreter_agent = AssistantAgent(
+            name="interpreter_agent",
+            system_message="You are an interpreter agent. When the user queries, you will interpret the query and, based on its nature, decide whether to prompt the structured or unstructured RAG agent or both. If the query is related to numerical data, you will prompt the structured RAG agent. Otherwise, you will prompt the unstructured RAG agent. If the query is ambiguous, you will prompt both agents.",
+            llm_config=basic_agent_llm_config
+        )
+
+        agent_group_chat = GroupChat(
+            agents=[structured_rag_agent, unstructured_rag_agent, interpreter_agent],
+            messages=[],
+            max_round=5,
+            speaker_selection_method="auto"
+        )
+
+        group_chat_manager_agent = GroupChatManager(
+            groupchat=agent_group_chat,
+            llm_config=basic_agent_llm_config
+        )
+
+        if app_settings.azure_openai.stream:
             result = await stream_chat_request(request_body, request_headers)
             response = await make_response(format_as_ndjson(result))
             response.timeout = None
             response.mimetype = "application/json-lines"
-            return response
+            return response 
         else:
-            result = await complete_chat_request(request_body, request_headers)
-            return jsonify(result)
+            filtered_messages = [message for message in request_body["messages"] if message.get("role") == 'user']
+            user_messages = " ".join([message["content"] for message in filtered_messages])
+            results = [] 
 
+            content = user_messages
+            chat_result = initializer_agent.initiate_chat(group_chat_manager_agent, message=content, summary_method="reflection_with_llm")
+            conversation_id = chat_result.chat_id
+
+            formatted_result = format_autogen_response(
+                chat_result,
+                model=None,
+                created=None,
+                object=None,
+                conversation_id=conversation_id,
+                title=None,
+                date=None,
+                error=None
+            )
+
+            results.append(formatted_result)
+
+            response = await make_response(json.dumps(results[-1]))
+            response.mimetype = "application/json"
+            return formatted_result
+                
     except Exception as ex:
         logging.exception(ex)
         if hasattr(ex, "status_code"):
@@ -837,9 +977,9 @@ async def ensure_cosmos():
             return jsonify({"error": "CosmosDB is not working"}), 500
 
 
-async def generate_title(conversation_messages) -> str:
+async def generate_title(conversation_messages):
     ## make sure the messages are sorted by _ts descending
-    title_prompt = "Summarize the conversation so far into a 4-word or less title. Do not use any quotation marks or punctuation. Do not include any other commentary or description."
+    title_prompt = 'Summarize the conversation so far into a 4-word or less title. Do not use any quotation marks or punctuation. Respond with a json object in the format {{"title": string}}. Do not include any other commentary or description.'
 
     messages = [
         {"role": msg["role"], "content": msg["content"]}
@@ -848,15 +988,14 @@ async def generate_title(conversation_messages) -> str:
     messages.append({"role": "user", "content": title_prompt})
 
     try:
-        azure_openai_client = init_openai_client()
+        azure_openai_client = init_openai_client(use_data=False)
         response = await azure_openai_client.chat.completions.create(
             model=app_settings.azure_openai.model, messages=messages, temperature=1, max_tokens=64
         )
 
-        title = response.choices[0].message.content
+        title = json.loads(response.choices[0].message.content)["title"]
         return title
     except Exception as e:
-        logging.exception("Exception while generating title", e)
         return messages[-2]["content"]
 
 
